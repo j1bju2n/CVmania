@@ -64,6 +64,10 @@ public partial class ExportDialog : Window
         SummaryText.Text = Loc.F("Export.Summary", map.Regions.Count, WaveformView.FormatTime(map.OutputLengthMs));
         UpdateOutputPath();
         UpdateScrollInfo();
+        // the folder name depends on these (it is shortened to keep the full paths under osu!'s 260 character limit)
+        TitleSuffixBox.TextChanged += (_, _) => UpdateOutputPath();
+        VersionBox.TextChanged += (_, _) => UpdateOutputPath();
+        CreatorBox.TextChanged += (_, _) => UpdateOutputPath();
     }
 
     private void Content_Changed(object sender, RoutedEventArgs e) => UpdateScrollInfo();
@@ -113,10 +117,27 @@ public partial class ExportDialog : Window
             {
                 var songs = _ctx.SongsFolder ?? Path.GetDirectoryName(mapDir)!;
                 var suffix = string.IsNullOrEmpty(TitleSuffixBox.Text) ? " (Cut Ver.)" : TitleSuffixBox.Text;
-                var name = CutExporter.SanitizeFileName($"{_ctx.Beatmap.Artist} - {_ctx.Beatmap.Title}{suffix}".Trim());
-                return Path.Combine(songs, name);
+                var artist = CutExporter.ReplaceInvalid(_ctx.Beatmap.Artist);
+                var title = CutExporter.ReplaceInvalid(_ctx.Beatmap.Title);
+                // osu! stable cannot open paths of 260+ characters: shorten the folder like osu! does, keeping the suffix
+                try { return Path.Combine(songs, ExportPaths.FitFolderName(songs, artist, title, CutExporter.ReplaceInvalid(suffix), LongestFileNameLength())); }
+                catch (PathTooLongException) { return Path.Combine(songs, CutExporter.SanitizeFileName($"{artist} - {title}{suffix}")); } // the export reports it
             }
         }
+    }
+
+    /// <summary>Length of the longest file the export will write: the .osu name osu! expects, the audio or the background.</summary>
+    private int LongestFileNameLength()
+    {
+        var b = _ctx.Beatmap;
+        var suffix = TitleSuffixBox.Text ?? "";
+        var title = b.Title.EndsWith(suffix.Trim(), StringComparison.Ordinal) ? b.Title : b.Title + suffix;
+        var creator = string.IsNullOrWhiteSpace(CreatorBox.Text) ? b.Creator : CreatorBox.Text.Trim();
+        var version = string.IsNullOrWhiteSpace(VersionBox.Text) ? b.Version : VersionBox.Text.Trim();
+        int osu = NoOsuRadio.IsChecked == true ? 0 : CutExporter.SanitizeFileName($"{b.Artist} - {title} ({creator}) [{version}].osu").Length;
+        int bg = CopyBgCheck.IsChecked == true ? (CutExporter.FindBackground(b)?.Length ?? 0) : 0;
+        int audio = (AudioNameBox.Text?.Trim().Length ?? 5) + 4;
+        return Math.Max(osu, Math.Max(bg, audio));
     }
 
     private void UpdateOutputPath()

@@ -48,8 +48,10 @@ public static class CutExporter
     public static ExportReport Export(OsuFile beatmap, PcmAudio sourceAudio, IReadOnlyList<CutRegion> regions, ExportOptions options,
         IProgress<string>? progress = null)
     {
+        // osu! stable cannot open paths of 260+ characters: refuse an over-long folder, shorten file names that would not fit
+        ExportPaths.EnsureDirectoryFits(options.OutputDirectory);
         Directory.CreateDirectory(options.OutputDirectory);
-        var audioName = options.AudioBaseName + ExtensionFor(options.Format);
+        var audioName = ExportPaths.FitFileName(options.OutputDirectory, options.AudioBaseName + ExtensionFor(options.Format));
         var audioPath = Path.Combine(options.OutputDirectory, audioName);
         var warnings = new List<string>();
 
@@ -73,23 +75,40 @@ public static class CutExporter
             progress?.Report("Writing beatmap...");
             cut = CutPlanner.Transform(beatmap, clipped, options.Cut, audioName);
             warnings.AddRange(cut.Warnings);
-            beatmapPath = Path.Combine(options.OutputDirectory, BuildOsuFileName(cut.Output));
-            cut.Output.Save(beatmapPath);
 
+            string? bgFrom = null, bgTo = null;
             if (options.CopyBackground && beatmap.SourcePath != null)
             {
                 var bg = FindBackground(beatmap);
                 if (bg != null)
                 {
-                    var srcDir = Path.GetDirectoryName(beatmap.SourcePath)!;
-                    var from = Path.Combine(srcDir, bg);
-                    var to = Path.Combine(options.OutputDirectory, bg);
-                    if (File.Exists(from) && !string.Equals(Path.GetFullPath(from), Path.GetFullPath(to), StringComparison.OrdinalIgnoreCase))
+                    bgFrom = Path.Combine(Path.GetDirectoryName(beatmap.SourcePath)!, bg);
+                    bgTo = Path.Combine(options.OutputDirectory, bg);
+                    if (Path.GetFullPath(bgTo).Length > ExportPaths.HardLimit)
                     {
-                        Directory.CreateDirectory(Path.GetDirectoryName(to)!);
-                        File.Copy(from, to, true);
+                        // keep the image reachable for osu!: copy it under a short name and point the .osu at it
+                        var shortName = "background" + Path.GetExtension(bg);
+                        if (ReplaceBackground(cut.Output, bg, shortName))
+                        {
+                            bgTo = Path.Combine(options.OutputDirectory, shortName);
+                            warnings.Add($"The background file name was too long for osu! (path limit 260) and was copied as '{shortName}'.");
+                        }
                     }
                 }
+            }
+
+            var osuName = BuildOsuFileName(cut.Output);
+            var fitted = ExportPaths.FitFileName(options.OutputDirectory, osuName);
+            if (fitted != osuName)
+                warnings.Add("The .osu file name was shortened so that osu! can open it (full paths must stay under 260 characters).");
+            beatmapPath = Path.Combine(options.OutputDirectory, fitted);
+            cut.Output.Save(beatmapPath);
+
+            if (bgFrom != null && bgTo != null && File.Exists(bgFrom) &&
+                !string.Equals(Path.GetFullPath(bgFrom), Path.GetFullPath(bgTo), StringComparison.OrdinalIgnoreCase))
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(bgTo)!);
+                File.Copy(bgFrom, bgTo, true);
             }
         }
 
@@ -160,10 +179,33 @@ public static class CutExporter
 
     public static string SanitizeFileName(string name)
     {
-        var invalid = Path.GetInvalidFileNameChars();
-        var chars = name.Select(c => invalid.Contains(c) ? '_' : c).ToArray();
-        var s = new string(chars).Trim();
+        var s = ReplaceInvalid(name).Trim();
         return s.Length == 0 ? "untitled" : s;
+    }
+
+    /// <summary>Invalid file-name characters replaced by '_', spaces untouched (for pieces that are joined later).</summary>
+    public static string ReplaceInvalid(string name)
+    {
+        var invalid = Path.GetInvalidFileNameChars();
+        return new string(name.Select(c => invalid.Contains(c) ? '_' : c).ToArray());
+    }
+
+    /// <summary>Points the background event of <paramref name="f"/> at another file name. False when no such line exists.</summary>
+    private static bool ReplaceBackground(OsuFile f, string oldName, string newName)
+    {
+        var sec = f.GetSection("Events");
+        if (sec == null) return false;
+        for (int i = 0; i < sec.Lines.Count; i++)
+        {
+            var parts = sec.Lines[i].Trim().Split(',');
+            if (parts.Length >= 3 && (parts[0] == "0" || parts[0].Equals("Background", StringComparison.OrdinalIgnoreCase)) &&
+                parts[2].Trim().Trim('"') == oldName)
+            {
+                sec.Lines[i] = sec.Lines[i].Replace(oldName, newName);
+                return true;
+            }
+        }
+        return false;
     }
 
     /// <summary>Background file name from [Events] (0,0,"bg.jpg",...), or null.</summary>

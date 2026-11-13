@@ -81,11 +81,23 @@ public partial class MainWindow : Window
     private bool _followOsuNoPersist;     // programmatic follow-osu changes (opening a file) are not saved as the preference
     private DateTime? _lastAutoSave;
     private bool _screenshotStarted;
+    private readonly DispatcherTimer _followTimer;   // osu! selection must rest for a moment before we load it
+    private string? _pendingFollowPath;
+    private CancellationTokenSource? _decodeCts;     // a superseded decode is stopped instead of finishing in the background
     private string? _sessionCheckOther;   // dev: another beatmap to switch to and back (see RunSessionCheckAsync)
 
     public MainWindow()
     {
         InitializeComponent();
+        // created before anything can report an osu! selection (setting the follow checkbox below already does)
+        _followTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(450) };
+        _followTimer.Tick += (_, _) =>
+        {
+            _followTimer!.Stop();
+            var path = _pendingFollowPath;
+            _pendingFollowPath = null;
+            if (path != null && FollowOsuCheck.IsChecked == true) FollowSelection(path);
+        };
         try
         {
             _player = new BassPlayer();
@@ -141,6 +153,15 @@ public partial class MainWindow : Window
         if (Height > wa.Height - 20) Height = Math.Max(MinHeight, wa.Height - 20);
         if (Width > wa.Width - 20) Width = Math.Max(MinWidth, wa.Width - 20);
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
+        if (Environment.GetCommandLineArgs().Any(a => a.Equals("--screenshot", StringComparison.OrdinalIgnoreCase)))
+        {
+            // dev rendering must never take the focus from what the owner is doing (osu!): off-screen and not activated
+            ShowActivated = false;
+            ShowInTaskbar = false;
+            WindowStartupLocation = WindowStartupLocation.Manual;
+            Left = -32000;
+            Top = -32000;
+        }
 
         Loaded += (_, _) => HandleCommandLine();
     }
@@ -196,12 +217,13 @@ public partial class MainWindow : Window
         await Task.Delay(1500);
         SaveVisual(this, Path.Combine(_screenshotDir, "main.png"));
         var dlg = new ExportDialog(BuildExportContext()!) { Owner = this };
-        dlg.Show();
+        dlg.ShowActivated = false; dlg.Show();
         await Task.Delay(800);
         SaveVisual(dlg, Path.Combine(_screenshotDir, "export.png"));
+        File.WriteAllText(Path.Combine(_screenshotDir, "export-path.txt"), dlg.OutputPathBox.Text); // the folder the export would create
         dlg.Close();
         var sc = new ShortcutsWindow(this);
-        sc.Show();
+        sc.ShowActivated = false; sc.Show();
         await Task.Delay(500);
         SaveVisual(sc, Path.Combine(_screenshotDir, "shortcuts.png"));
         sc.Close();
@@ -209,7 +231,7 @@ public partial class MainWindow : Window
         {
             var msg = BuildCutPointMessage(_regionList[^1].StartMs + 137, _regionList[^1].EndMs + 250, true, true) ?? "(on grid)";
             var md = MessageDialog.CreateForScreenshot(this, Loc.T("Confirm.Title"), Loc.T("Confirm.Question"), msg);
-            md.Show();
+            md.ShowActivated = false; md.Show();
             await Task.Delay(500);
             SaveVisual(md, Path.Combine(_screenshotDir, "confirm.png"));
             md.Close();
@@ -222,7 +244,7 @@ public partial class MainWindow : Window
         };
         var nd = new NoteIssuesDialog(this, sampleIssues);
         nd.ExpandDetails();
-        nd.Show();
+        nd.ShowActivated = false; nd.Show();
         await Task.Delay(500);
         SaveVisual(nd, Path.Combine(_screenshotDir, "issues.png"));
         nd.Close();
@@ -449,10 +471,17 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>
+    /// Scrolling through song select changes the selection many times a second; decoding every song on
+    /// the way cost hundreds of MB each (Windows flagged the process for memory growth). Only the
+    /// selection osu! rests on is loaded.
+    /// </summary>
     private void OnOsuBeatmapChanged(string? path)
     {
         if (FollowOsuCheck.IsChecked != true || path == null) return;
-        FollowSelection(path);
+        _pendingFollowPath = path;
+        _followTimer.Stop();
+        _followTimer.Start();
     }
 
     /// <summary>osu! selected another beatmap: load it, unless it is a cut version this app wrote (testing it must not replace the work).</summary>
@@ -473,6 +502,7 @@ public partial class MainWindow : Window
     private async Task LoadBeatmapAsync(string path)
     {
         var token = ++_loadToken;
+        _decodeCts?.Cancel(); // whatever was still decoding is no longer wanted
         OsuFile file;
         try { file = OsuFile.Load(path); }
         catch (Exception ex)
@@ -538,7 +568,12 @@ public partial class MainWindow : Window
         PcmAudio pcm;
         try
         {
-            pcm = await Task.Run(() => BassDecoder.DecodeFile(audioPath));
+            var cts = _decodeCts = new CancellationTokenSource();
+            pcm = await Task.Run(() => BassDecoder.DecodeFile(audioPath, cts.Token));
+        }
+        catch (OperationCanceledException)
+        {
+            return; // a newer beatmap was requested; that load owns the UI state now
         }
         catch (Exception ex)
         {
@@ -552,6 +587,9 @@ public partial class MainWindow : Window
 
         _audio = pcm;
         _audioPath = audioPath;
+        // the previous song's buffers (100+ MB each, large object heap) are garbage now: give the memory back
+        System.Runtime.GCSettings.LargeObjectHeapCompactionMode = System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+        GC.Collect();
         Detail.SetAudio(pcm);
         Overview.SetAudio(pcm);
         try

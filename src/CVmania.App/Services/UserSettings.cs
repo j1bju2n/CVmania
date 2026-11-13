@@ -78,8 +78,12 @@ public sealed class UserSettings
         return new UserSettings();
     }
 
+    /// <summary>Dev screenshot runs read the settings but never write them.</summary>
+    public static bool SaveDisabled { get; set; }
+
     public void Save()
     {
+        if (SaveDisabled) return;
         try
         {
             Directory.CreateDirectory(App.LogDirectory);

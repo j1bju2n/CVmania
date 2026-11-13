@@ -26,6 +26,7 @@ public partial class App : Application
         TaskScheduler.UnobservedTaskException += (_, args) => { WriteCrash(args.Exception); args.SetObserved(); };
 
         MigrateOldSettings();
+        UserSettings.SaveDisabled = e.Args.Any(a => a.Equals("--screenshot", StringComparison.OrdinalIgnoreCase));
         Settings = UserSettings.Load();
         Loc.Apply(Settings.Language);
     }

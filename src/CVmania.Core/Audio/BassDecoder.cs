@@ -48,12 +48,12 @@ public static class BassRuntime
 public static class BassDecoder
 {
     /// <summary>Decode a whole audio file (mp3/ogg/wav/...) to float PCM.</summary>
-    public static PcmAudio DecodeFile(string path)
+    public static PcmAudio DecodeFile(string path, CancellationToken cancel = default)
     {
         BassRuntime.EnsureInit();
         int h = Bass.CreateStream(path, 0, 0, BassFlags.Decode | BassFlags.Float | BassFlags.Prescan);
         if (h == 0) throw new IOException($"BASS could not open '{path}': {Bass.LastError}");
-        try { return ReadAll(h); }
+        try { return ReadAll(h, cancel); }
         finally { Bass.StreamFree(h); }
     }
 
@@ -72,26 +72,34 @@ public static class BassDecoder
         finally { handle.Free(); }
     }
 
-    private static PcmAudio ReadAll(int h)
+    /// <summary>
+    /// Reads the whole stream into one buffer sized from the prescanned length (a second copy of a
+    /// five-minute song is ~120 MB, so no intermediate list). A superseded load is cancelled between chunks.
+    /// </summary>
+    private static PcmAudio ReadAll(int h, CancellationToken cancel = default)
     {
         var info = Bass.ChannelGetInfo(h);
         int channels = info.Channels;
         int sampleRate = info.Frequency;
         long lengthBytes = Bass.ChannelGetLength(h, PositionFlags.Bytes);
-        var result = new List<float>(lengthBytes > 0 ? (int)Math.Min(int.MaxValue / 2, lengthBytes / 4 + 1024) : 1 << 20);
+        long expected = lengthBytes > 0 ? lengthBytes / sizeof(float) : 1 << 20;
+        var buffer = new float[Math.Min(Array.MaxLength, Math.Max(expected, channels))];
+        int filled = 0;
         var chunk = new float[sampleRate * channels]; // one second
         while (true)
         {
+            cancel.ThrowIfCancellationRequested();
             int got = Bass.ChannelGetData(h, chunk, chunk.Length * sizeof(float));
             if (got <= 0) break;
             int floats = got / sizeof(float);
-            for (int i = 0; i < floats; i++) result.Add(chunk[i]);
+            if (filled + floats > buffer.Length)
+                Array.Resize(ref buffer, (int)Math.Min(Array.MaxLength, Math.Max((long)buffer.Length * 2, filled + floats)));
+            Array.Copy(chunk, 0, buffer, filled, floats);
+            filled += floats;
         }
-        var arr = result.ToArray();
-        // make sure the frame count is whole
-        int rem = arr.Length % channels;
-        if (rem != 0) Array.Resize(ref arr, arr.Length - rem);
-        return new PcmAudio(arr, sampleRate, channels);
+        filled -= filled % channels; // whole frames only
+        if (filled != buffer.Length) Array.Resize(ref buffer, filled);
+        return new PcmAudio(buffer, sampleRate, channels);
     }
 
     /// <summary>Duration in ms as BASS reports it, without decoding everything.</summary>
